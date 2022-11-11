@@ -63,6 +63,8 @@
 
 #define MAX_RECV_BUF_LEN       0xFFFF   // Max incoming packet size.
 
+#define USE_NBIO 1
+
 int   gAddressFamily=AF_UNSPEC,         // Address family to use
       gProtocol=IPPROTO_ICMP,           // Protocol value
       gTtl=DEFAULT_TTL;                 // Default TTL value
@@ -552,6 +554,24 @@ int SetTtl(SOCKET s, int ttl)
     return rc;
 }
         
+
+int SetNBIO(SOCKET s, int nbio)
+{
+    int rc;
+
+    if (nbio)
+    {
+        DWORD optval = 1;
+
+        rc = ioctlsocket(s, FIONBIO, &optval);
+        if (rc == SOCKET_ERROR)
+        {
+            fprintf(stderr, "ioctlsocket(FIONBIO) failed: %d\n", WSAGetLastError());
+        }
+    }
+
+    return rc;
+}
 //
 // Function: main
 //
@@ -648,6 +668,8 @@ int __cdecl main(int argc, char **argv)
     }
 
     SetTtl(s, gTtl);
+
+    SetNBIO(s, USE_NBIO);
 
     // Figure out the size of the ICMP header and payload
     if (gAddressFamily == AF_INET)
