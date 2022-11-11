@@ -65,6 +65,8 @@
 
 #define USE_NBIO 1
 
+#define USE_IPHDR 1
+
 int   gAddressFamily=AF_UNSPEC,         // Address family to use
       gProtocol=IPPROTO_ICMP,           // Protocol value
       gTtl=DEFAULT_TTL;                 // Default TTL value
@@ -92,6 +94,33 @@ void usage(char *progname)
     printf("            -r           Record route (IPv4 only)\n");
 
     return;
+}
+
+void InitIpv4Header(char* buf, SOCKET s, struct addrinfo* dest, int datasize)
+{
+    IPV4_HDR         *ipv4_hdr = NULL;
+    SOCKADDR_IN       src;
+    int               rc;
+    DWORD             bytes;
+
+    // obtain the address of the local interface to send to dest
+    rc = WSAIoctl(s, SIO_ROUTING_INTERFACE_QUERY, dest->ai_addr, (DWORD)dest->ai_addrlen, &src, (DWORD)sizeof(src), &bytes, NULL, NULL);
+    if (rc == SOCKET_ERROR)
+    {
+        fprintf(stderr, "WSAIoctl failed: %d\n", WSAGetLastError());
+    }
+
+    ipv4_hdr = (IPV4_HDR*)buf;
+    ipv4_hdr->ip_verlen = (4 << 4) | (sizeof(IPV4_HDR) / sizeof(unsigned long));
+    ipv4_hdr->ip_tos = 0; // TBC
+    ipv4_hdr->ip_totallength = htons(sizeof(IPV4_HDR) + sizeof(ICMP_HDR) + datasize);
+    ipv4_hdr->ip_id = 0;
+    ipv4_hdr->ip_offset = 0x4000; // TBC
+    ipv4_hdr->ip_ttl = 0; // TBC
+    ipv4_hdr->ip_protocol = IPPROTO_ICMP;
+    ipv4_hdr->ip_checksum = 0; // TODO
+    ipv4_hdr->ip_srcaddr = src.sin_addr.s_addr;
+    ipv4_hdr->ip_destaddr = ((SOCKADDR_IN*)dest->ai_addr)->sin_addr.s_addr;
 }
 
 // 
@@ -415,6 +444,15 @@ void ComputeIcmpChecksum(SOCKET s, char *buf, int packetlen, struct addrinfo *de
     }
 }
 
+void ComputeIpv4Checksum(SOCKET s, char* buf)
+{
+    IPV4_HDR* ipv4 = NULL;
+
+    ipv4 = (IPV4_HDR*)buf;
+    ipv4->ip_checksum = 0;
+    ipv4->ip_checksum = checksum((USHORT*)buf, sizeof(IPV4_HDR));
+}
+
 //
 // Function: PostRecvfrom
 //
@@ -553,7 +591,7 @@ int SetTtl(SOCKET s, int ttl)
     }
     return rc;
 }
-        
+
 
 int SetNBIO(SOCKET s, int nbio)
 {
@@ -591,6 +629,12 @@ int __cdecl main(int argc, char **argv)
     WSAOVERLAPPED      recvol;
     SOCKET             s=INVALID_SOCKET;
     char              *icmpbuf=NULL;
+#if USE_IPHDR
+    char              *ipbuf = NULL;
+    BOOL               iphdr = TRUE;
+#else
+    BOOL               iphdr = FALSE;
+#endif
     struct addrinfo   *dest=NULL,
                       *local=NULL;
     IPV4_OPTION_HDR    ipopt;
@@ -680,13 +724,28 @@ int __cdecl main(int argc, char **argv)
     // Add in the data size
     packetlen += gDataSize;
 
-    // Allocate the buffer that will contain the ICMP request
-    icmpbuf = (char *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, packetlen);
-    if (icmpbuf == NULL)
+    if (gAddressFamily == AF_INET && iphdr == TRUE)
     {
-        fprintf(stderr, "HeapAlloc failed: %d\n", GetLastError());
-        status = -1;
-        goto CLEANUP;
+        packetlen += sizeof(IPV4_HDR);
+        ipbuf = (char*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, packetlen);
+        if (ipbuf == NULL)
+        {
+            fprintf(stderr, "HeapAlloc failed: %d\n", GetLastError());
+            status = -1;
+            goto CLEANUP;
+        }
+        icmpbuf = ipbuf + sizeof(IPV4_HDR);
+    }
+    else
+    {
+        // Allocate the buffer that will contain the ICMP request
+        icmpbuf = (char*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, packetlen);
+        if (icmpbuf == NULL)
+        {
+            fprintf(stderr, "HeapAlloc failed: %d\n", GetLastError());
+            status = -1;
+            goto CLEANUP;
+        }
     }
 
     // Initialize the ICMP headers
@@ -710,6 +769,11 @@ int __cdecl main(int argc, char **argv)
             }
         }
 
+        if (iphdr == TRUE)
+        {
+            // unfortunately local is not correctly set
+            InitIpv4Header(ipbuf, s, dest, gDataSize);
+        }
         InitIcmpHeader(icmpbuf, gDataSize);
     }
     else if (gAddressFamily == AF_INET6)
@@ -748,18 +812,44 @@ int __cdecl main(int argc, char **argv)
     for(i=0; i < DEFAULT_SEND_COUNT ;i++)
     {
         // Set the sequence number and compute the checksum
+        if (gAddressFamily == AF_INET && iphdr == TRUE)
+        {
+            int optval = 1;
+            ComputeIpv4Checksum(s, ipbuf);
+            rc = setsockopt(s, IPPROTO_IP, IP_HDRINCL, (char*)&optval, sizeof(optval));
+            if (rc == SOCKET_ERROR)
+            {
+                fprintf(stderr, "setsockopt(IP_HDRINCL) failed: %d\n", WSAGetLastError());
+                status = -1;
+                goto CLEANUP;
+            }
+        }
         SetIcmpSequence(icmpbuf);
         ComputeIcmpChecksum(s, icmpbuf, packetlen, dest);
 
         time = GetTickCount();
-        rc = sendto(
+        if (gAddressFamily == AF_INET && iphdr == TRUE)
+        {
+            rc = sendto(
+                s,
+                ipbuf,
+                packetlen,
+                0,
+                dest->ai_addr,
+                (int)dest->ai_addrlen
+            );
+        }
+        else
+        {
+            rc = sendto(
                 s,
                 icmpbuf,
                 packetlen,
                 0,
                 dest->ai_addr,
                 (int)dest->ai_addrlen
-                );
+            );
+        }
         if (rc == SOCKET_ERROR)
         {
             fprintf(stderr, "sendto failed: %d\n", WSAGetLastError());
@@ -827,6 +917,13 @@ CLEANUP:
         closesocket(s);
     if (recvol.hEvent != WSA_INVALID_EVENT)
         WSACloseEvent(recvol.hEvent);
+#if USE_IPHDR
+    if (ipbuf)
+    {
+        HeapFree(GetProcessHeap(), 0, ipbuf);
+        icmpbuf = NULL;
+    }
+#endif
     if (icmpbuf)
         HeapFree(GetProcessHeap(), 0, icmpbuf);
 
